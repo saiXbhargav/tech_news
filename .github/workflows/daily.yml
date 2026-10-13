@@ -2,12 +2,19 @@ name: Daily Tech & Markets Brief
 
 on:
   schedule:
-    # 01:15 UTC = 06:45 IST. GitHub cron can run 5-30 min late, so this lands before 7:30 IST.
-    - cron: "15 1 * * *"
-  workflow_dispatch: # "Run workflow" button for manual tests
+    # GitHub may delay or silently drop scheduled runs, so there are 3 attempts.
+    # The first one that runs sends the email; the others see last_sent.txt and skip.
+    - cron: "40 0 * * *" # 06:10 IST
+    - cron: "10 1 * * *" # 06:40 IST
+    - cron: "40 1 * * *" # 07:10 IST
+  workflow_dispatch: # "Run workflow" button: always sends
 
 permissions:
-  contents: write # needed for the keep-alive commit below
+  contents: write # needed to commit last_sent.txt
+
+concurrency:
+  group: daily-brief # backup runs wait in line instead of running in parallel
+  cancel-in-progress: false
 
 jobs:
   brief:
@@ -15,15 +22,30 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: main # latest commit, so we see a last_sent.txt pushed by an earlier run
+
+      - name: Skip if already sent today
+        id: check
+        run: |
+          today=$(TZ=Asia/Kolkata date +%F)
+          echo "today=$today" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" = "schedule" ] && [ "$(cat last_sent.txt 2>/dev/null)" = "$today" ]; then
+            echo "Already sent today, skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
 
       - uses: actions/setup-python@v5
+        if: steps.check.outputs.skip != 'true'
         with:
           python-version: "3.12"
           cache: pip
 
-      - run: pip install -r requirements.txt
+      - if: steps.check.outputs.skip != 'true'
+        run: pip install -r requirements.txt
 
       - name: Build and send the brief
+        if: steps.check.outputs.skip != 'true'
         run: python main.py
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -31,14 +53,14 @@ jobs:
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
 
-      # GitHub disables scheduled workflows after 60 days without repo activity.
-      # Push an empty commit if the last commit is older than 45 days.
-      - name: Keep schedule alive
+      # Record today's send. This daily commit also keeps the repo "active",
+      # so GitHub never auto-disables the schedule (it does after 60 idle days).
+      - name: Mark as sent
+        if: steps.check.outputs.skip != 'true'
         run: |
-          last=$(git log -1 --format=%ct)
-          if [ $(( $(date +%s) - last )) -gt $(( 45 * 86400 )) ]; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git commit --allow-empty -m "chore: keep scheduled workflow alive"
-            git push
-          fi
+          echo "${{ steps.check.outputs.today }}" > last_sent.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add last_sent.txt
+          git commit -m "brief sent ${{ steps.check.outputs.today }}" || exit 0
+          git pull --rebase && git push
